@@ -26,6 +26,16 @@ sast:
       - gl-sast-report.json
     reports:
       sast: gl-sast-report.json
+    
+semgrep-sast:
+  stage: sast
+  artifacts:
+    name: sast-report
+    expire_in: 1 day
+    paths:
+      - gl-sast-report.json
+    reports:
+      sast: gl-sast-report.json
 
 secret_detection:
   stage: secrets
@@ -93,7 +103,7 @@ upload_to_defectdojo:
   stage: defectdojo
   image: python:3.11-alpine
   dependencies:
-    - sast
+    - semgrep-sast
     - secret_detection
     - sca_scan
     - zap_dast_scan
@@ -111,7 +121,7 @@ upload_to_defectdojo:
       ENGAGEMENT_NAME = os.environ.get('PRODUCT_NAME')
 
       if not DD_URL or not API_KEY:
-          print('[-] Error crítico: DEFECTDOJO_URL (o DD_URL) y DEFECTDOJO_API_KEY deben estar configuradas en las variables CI/CD de GitLab.')
+          print('[-] Critical error: DEFECTDOJO_URL (or DD_URL) and DEFECTDOJO_API_KEY must be configured in the GitLab CI/CD variables.')
           exit(1)
 
       headers = {'Authorization': f'Token {API_KEY}'}
@@ -124,27 +134,26 @@ upload_to_defectdojo:
           except Exception as e:
               return None
 
-      # 1. Obtener o Crear Producto
-      print(f'[*] Buscando producto: {PRODUCT_NAME}...')
+      print(f'[*] Looking for product: {PRODUCT_NAME}...')
       prod_res = api_get(f'products/?name={urllib.parse.quote(PRODUCT_NAME)}')
       if prod_res and prod_res.get('results'):
           product_id = prod_res['results'][0]['id']
-          print(f'-> Producto encontrado con ID: {product_id}')
+          print(f'-> Product found with ID: {product_id}')
       else:
-          print(f'-> Producto no encontrado. Buscando un Tipo de Producto (prod_type) válido...')
+          print(f'-> Product not found. Searching for a valid Product Type (prod_type)...')
           
           # DefectDojo requiere un prod_type obligatorio para crear productos
           pt_res = api_get('product_types/?limit=1')
           prod_type_id = None
           if pt_res and pt_res.get('results'):
               prod_type_id = pt_res['results'][0]['id']
-              print(f'-> Usando Product Type ID: {prod_type_id} ({pt_res[\"results\"][0][\"name\"]})')
+              print(f'-> Using Product Type ID: {prod_type_id} ({pt_res[\"results\"][0][\"name\"]})')
           else:
               # Fallback por defecto si la lista estuviera vacía
               prod_type_id = 1
-              print(f'-> No se encontraron tipos de producto, usando ID por defecto: {prod_type_id}')
+              print(f'-> Not found product type, using generic one: {prod_type_id}')
 
-          print(f'-> Creando \"{PRODUCT_NAME}\"...')
+          print(f'-> Creating \"{PRODUCT_NAME}\"...')
           data = json.dumps({
               'name': PRODUCT_NAME, 
               'description': 'Auto-creado por GitLab CI',
@@ -155,19 +164,18 @@ upload_to_defectdojo:
           try:
               with urllib.request.urlopen(req) as resp:
                   product_id = json.loads(resp.read().decode())['id']
-                  print(f'-> Producto creado con éxito con ID: {product_id}')
+                  print(f'-> Product created successfully with ID: {product_id}')
           except urllib.error.HTTPError as e:
-              print(f'[-] Error HTTP al crear producto: {e.code} - {e.read().decode()}')
+              print(f'[-] HTTP Error creating product: {e.code} - {e.read().decode()}')
               exit(1)
 
-      # 2. Obtener o Crear Engagement
-      print(f'[*] Buscando engagement: {ENGAGEMENT_NAME}...')
+      print(f'[*] Looking for engagement: {ENGAGEMENT_NAME}...')
       eng_res = api_get(f'engagements/?product={product_id}&name={urllib.parse.quote(ENGAGEMENT_NAME)}')
       if eng_res and eng_res.get('results'):
           engagement_id = eng_res['results'][0]['id']
-          print(f'-> Engagement encontrado con ID: {engagement_id}')
+          print(f'-> Engagement found with ID: {engagement_id}')
       else:
-          print(f'-> Engagement no encontrado. Creando...')
+          print(f'-> Engagement not found. Creating it...')
           import datetime
           today = datetime.date.today().isoformat()
           end_date = (datetime.date.today() + datetime.timedelta(days=365)).isoformat()
@@ -183,15 +191,14 @@ upload_to_defectdojo:
           try:
               with urllib.request.urlopen(req) as resp:
                   engagement_id = json.loads(resp.read().decode())['id']
-                  print(f'-> Engagement creado con ID: {engagement_id}')
+                  print(f'-> Created engagement with ID: {engagement_id}')
           except urllib.error.HTTPError as e:
-              print(f'[-] Error HTTP al crear engagement: {e.code} - {e.read().decode()}')
+              print(f'[-] Error HTTP creating engagement: {e.code} - {e.read().decode()}')
               exit(1)
 
-      # Función inteligente de subida (Import / Reimport / SBOM)
       def upload_scan(filepath, scan_type, is_sbom=False):
           if not os.path.exists(filepath):
-              print(f'[-] Fichero de artefacto no encontrado en workspace: {filepath}')
+              print(f'[-] Artifact not found: {filepath}')
               return
 
           tests_res = api_get(f'tests/?engagement={engagement_id}&limit=100')
@@ -203,7 +210,7 @@ upload_to_defectdojo:
                       break
 
           endpoint = 'import-sbom/' if is_sbom else ('reimport-scan/' if existing_test_id else 'import-scan/')
-          print(f'[*] Procesando {filepath} como [{scan_type}] vía endpoint /{endpoint}...')
+          print(f'[*] Processing {filepath} as [{scan_type}] vía /{endpoint}...')
 
           curl_cmd = [
               'curl', '-s', '-X', 'POST', f'{DD_URL}/api/v2/{endpoint}',
@@ -223,78 +230,14 @@ upload_to_defectdojo:
           result = subprocess.run(curl_cmd, capture_output=True, text=True)
           print(result.stdout)
 
-      # Lista completa de envíos a DefectDojo
+      print(f'[*] Uploading scan reports to DefectDojo...')
       upload_scan('gl-sast-report.json', 'GitLab SAST Report')
+      print(f'[*] Uploading secret detection report...')
       upload_scan('gl-secret-detection-report.json', 'GitLab Secret Detection Report')
-      upload_scan('grype-report.json', 'Anchore Grype')
+      print(f'[*] Uploading SCA scan report...')
+      upload_scan('grype-sca-report.json', 'Anchore Grype')
+      print(f'[*] Uploading DAST ZAP scan report...')
       upload_scan('zap-report.xml', 'ZAP Scan')
-      upload_scan('sbom.json', 'CycloneDX Scan', is_sbom=True)
+      print(f'[*] Uploading SBOM report...')
+      upload_scan('sbom-report.json', 'CycloneDX Scan', is_sbom=True)
       "
-
-# defectdojo_upload:
-#   stage: defectdojo
-#   image: alpine:latest
-#   when: always
-#   before_script:
-#     - apk add --no-cache curl
-#   script:
-#     - |
-#       set -eu
-
-#       : "${DD_URL:?Debes configurar DD_URL}"
-#       : "${DD_API_TOKEN:?Debes configurar DD_API_TOKEN}"
-#       : "${DD_PRODUCT_ID:?Debes configurar DD_PRODUCT_ID}"
-#       : "${DD_ENGAGEMENT_ID:?Debes configurar DD_ENGAGEMENT_ID}"
-
-#       DD_URL="${DD_URL%/}"
-#       API="${DD_URL}/api/v2/import-scan/"
-
-#       upload_scan() {
-#         file="$1"
-#         scan_type="$2"
-
-#         if [ ! -s "$file" ]; then
-#           echo "ERROR: No existe el informe $file o está vacío"
-#           return 1
-#         fi
-
-#         echo "Importando $file como $scan_type..."
-
-#         curl --fail-with-body --silent --show-error \
-#           --retry 2 \
-#           --retry-delay 2 \
-#           --request POST "$API" \
-#           --header "Authorization: Token ${DD_API_TOKEN}" \
-#           --form "engagement=${DD_ENGAGEMENT_ID}" \
-#           --form "scan_type=${scan_type}" \
-#           --form "file=@${file}" \
-#           --form "active=true" \
-#           --form "verified=false" \
-#           --form "close_old_findings=false"
-
-#         echo ""
-#         echo "Importación completada: $file"
-#       }
-
-#       upload_scan "gl-sast-report.json" "GitLab SAST Report"
-#       upload_scan "gl-secret-detection-report.json" "GitLab Secret Detection Report"
-#       upload_scan "grype-sca-report.json" "Anchore Grype"
-#       upload_scan "zap-report.xml" "ZAP Scan"
-
-#       # El SBOM tiene un endpoint específico en DefectDojo.
-#       if [ -s "sbom-report.json" ]; then
-#         echo "Importando SBOM CycloneDX..."
-
-#         curl --fail-with-body --silent --show-error \
-#           --request POST "${DD_URL}/api/v2/sbom-import/" \
-#           --header "Authorization: Token ${DD_API_TOKEN}" \
-#           --form "product=${DD_PRODUCT_ID}" \
-#           --form "scan_type=CycloneDX" \
-#           --form "file=@sbom-report.json"
-
-#         echo ""
-#         echo "Importación del SBOM completada."
-#       else
-#         echo "ERROR: No se encuentra sbom-report.json"
-#         exit 1
-#       fi
